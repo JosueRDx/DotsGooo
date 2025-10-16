@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { socket, connectSocket, disconnectSocket } from "../../services/websocket/socketService";
 import { 
@@ -25,24 +25,33 @@ import personaje5 from "../../assets/images/personajes/5.png";
 import personaje6 from "../../assets/images/personajes/6.png";
 import { API_URL } from "../../utils/constants";
 
+const GAME_STATE_STORAGE_KEY = "adminGameState";
+
 export default function Admin() {
   const [activeSection, setActiveSection] = useState('crear-juego');
   const [isMobile, setIsMobile] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   
   // Estados para crear juego (manteniendo funcionalidad original)
-  const [juegoCreado, setJuegoCreado] = useState(false);
   const [tiempo, setTiempo] = useState("");
   const [codigo, setCodigo] = useState("");
   const [selectedQuestions, setSelectedQuestions] = useState([]);
   const [tiempoJuego, setTiempoJuego] = useState("30");
   const [nombreJuego, setNombreJuego] = useState("");
   const [dificultad, setDificultad] = useState("medio");
-  const [players, setPlayers] = useState([]);
-  const [questions, setQuestions] = useState([]);
   const [esperandoResultados, setEsperandoResultados] = useState(false);
+  const [juegoCreado, setJuegoCreado] = useState(false);
+  const [questions, setQuestions] = useState([]);
+
+  const [currentQuestion, setCurrentQuestion] = useState(0);
+  const [totalQuestions, setTotalQuestions] = useState(0);
+  const [playerRankings, setPlayerRankings] = useState([]);
+  const [showRanking, setShowRanking] = useState(false);
+  const [players, setPlayers] = useState([]);
   
   const navigate = useNavigate();
+
+
 
   // Detectar tamaño de pantalla
   useEffect(() => {
@@ -77,22 +86,141 @@ export default function Admin() {
   useEffect(() => {
     connectSocket();
 
-    socket.on("player-joined", ({players}) => {
+    const handlePlayerJoined = ({ players }) => {
       setPlayers(players);
+    };
+
+    socket.on("game-started", (data) => {
+      setCurrentQuestion(data.currentIndex);
+      setTotalQuestions(data.totalQuestions);
     });
 
-    socket.on("game-ended", ({ results }) => {
+    const handleGameEnded = ({ results }) => {
       console.log("Resultados finales recibidos en Admin:", results);
       setEsperandoResultados(false);
+      resetGame();
       navigate("/game-results", { state: { results } });
+    };
+
+    const restoreSavedGame = () => {
+      if (typeof window === "undefined") return;
+
+      const savedGameJSON = localStorage.getItem(GAME_STATE_STORAGE_KEY);
+      if (!savedGameJSON) return;
+
+      try {
+        const savedGame = JSON.parse(savedGameJSON);
+
+        if (savedGame.pin) {
+          setCodigo(savedGame.pin);
+          setJuegoCreado(true);
+        }
+
+        if (savedGame.tiempoJuego) {
+          const storedTime = String(savedGame.tiempoJuego);
+          setTiempo(storedTime);
+          setTiempoJuego(storedTime);
+        }
+
+        if (savedGame.nombreJuego) {
+          setNombreJuego(savedGame.nombreJuego);
+        }
+
+        if (Array.isArray(savedGame.selectedQuestions)) {
+          setSelectedQuestions(savedGame.selectedQuestions);
+        }
+
+        if (savedGame.esperandoResultados) {
+          setEsperandoResultados(true);
+        }
+      } catch (error) {
+        console.error("Error al restaurar el estado del juego guardado:", error);
+        localStorage.removeItem(GAME_STATE_STORAGE_KEY);
+      }
+    };
+
+    const attemptRejoin = () => {
+      if (typeof window === "undefined") return;
+
+      const savedGameJSON = localStorage.getItem(GAME_STATE_STORAGE_KEY);
+      if (!savedGameJSON) return;
+
+      let savedGame;
+      try {
+        savedGame = JSON.parse(savedGameJSON);
+      } catch (error) {
+        console.error("Error al parsear estado de juego almacenado:", error);
+        localStorage.removeItem(GAME_STATE_STORAGE_KEY);
+        return;
+      }
+
+      if (!savedGame.pin) return;
+
+      socket.emit("rejoin-host", { pin: savedGame.pin }, (response) => {
+        if (!response?.success) {
+          resetGame();
+          return;
+        }
+
+        const { game } = response;
+        setPlayers(game.players || []);
+
+        if (game.status === "finished") {
+          resetGame();
+          return;
+        }
+
+        const isPlaying = game.status === "playing";
+        setEsperandoResultados(isPlaying);
+        saveGameState({ esperandoResultados: isPlaying });
+      });
+    };
+
+    restoreSavedGame();
+
+    socket.on("player-joined", handlePlayerJoined);
+    socket.on("game-ended", handleGameEnded);
+    socket.on("connect", attemptRejoin);
+
+    if (socket.connected) {
+      attemptRejoin();
+    }
+
+    socket.on("ranking-updated", (data) => {
+      console.log("Actualización de estado recibida:", data);
+      if (data.players) {
+        // Asegurarse de que los jugadores tengan los campos necesarios
+        const updatedPlayers = data.players.map(player => ({
+          id: player.id || player._id || Math.random().toString(36).substr(2, 9),
+          username: player.username || 'Jugador',
+          score: player.score || 0,
+          correctAnswers: player.correctAnswers || 0,
+          wrongAnswers: player.wrongAnswers || 0,
+          totalResponseTime: player.totalResponseTime || 0
+        }));
+        
+        // Ordenar jugadores por puntuación (de mayor a menor)
+        const sortedPlayers = [...updatedPlayers].sort((a, b) => b.score - a.score);
+        setPlayerRankings(sortedPlayers);
+      }
+      if (data.currentQuestion) {
+        setCurrentQuestion(data.currentQuestion);
+      }
+      if (data.totalQuestions) {
+        setTotalQuestions(data.totalQuestions);
+      }
     });
 
+
     return () => {
-      socket.off("player-joined");
-      socket.off("game-ended");
+      socket.off("player-joined", handlePlayerJoined);
+      socket.off("game-ended", handleGameEnded);
+      socket.off("connect", attemptRejoin);
+      socket.off("game-started");
+      socket.off("ranking-updated"); 
       disconnectSocket();
     };
-  }, [navigate]);
+  }, [navigate, resetGame, saveGameState]);
 
   const menuItems = [
     { id: 'crear-juego', label: 'Crear Juego', icon: <Gamepad2 size={20} />, color: '#6366f1' },
@@ -153,7 +281,7 @@ export default function Admin() {
         : [...prevSelected, questionId]
     );
   };
-
+  
   const selectAllQuestions = () => {
     const allQuestionIds = questions.map(q => q._id);
     setSelectedQuestions(allQuestionIds);
@@ -165,47 +293,42 @@ export default function Admin() {
 
   // Funciones originales del juego
   const handleCrearJuego = () => {
-  if (selectedQuestions.length === 0) {
-    alert("Por favor, selecciona al menos una pregunta antes de crear el juego.");
-    return;
-  }
-
-  console.log(`Admin: Creando juego con ${selectedQuestions.length} preguntas:`, selectedQuestions);
-
-  socket.emit("create-game", { 
-    timeLimit: parseInt(tiempoJuego), 
-    questionIds: selectedQuestions 
-  }, (response) => {
-    if (response.success) {
-      setCodigo(response.pin);
-      setTiempo(tiempoJuego);
-      setJuegoCreado(true);
-      console.log(`Admin: Juego creado con PIN ${response.pin}`);
-    } else {
-      alert(response.error || "Error al crear el juego");
-      console.error("Error al crear juego:", response.error);
+    if (selectedQuestions.length === 0) {
+      alert("Por favor, selecciona al menos una pregunta antes de crear el juego.");
+      return;
     }
-  });
-};
 
-  const handleIniciarJuego = () => {
-    setEsperandoResultados(true);
-    socket.emit("start-game", { pin: codigo }, (response) => {
-      if (!response.success) {
-        setEsperandoResultados(false);
-        alert(response.error || "Error al iniciar el juego");
+    console.log(`Admin: Creando juego con ${selectedQuestions.length} preguntas:`, selectedQuestions);
+
+  socket.emit("create-game", {
+    timeLimit: parseInt(tiempoJuego),
+    questionIds: selectedQuestions
+    }, (response) => {
+      if (response.success) {
+        setCodigo(response.pin);
+        setTiempo(tiempoJuego);
+        setJuegoCreado(true);
+        saveGameState({ pin: response.pin, esperandoResultados: false });
+        console.log(`Admin: Juego creado con PIN ${response.pin}`);
+      } else {
+        alert(response.error || "Error al crear el juego");
+        console.error("Error al crear juego:", response.error);
       }
     });
   };
 
-  const resetGame = () => {
-    setJuegoCreado(false);
-    setCodigo("");
-    setTiempo("");
-    setPlayers([]);
-    setSelectedQuestions([]);
-    setNombreJuego("");
-    setEsperandoResultados(false);
+  const handleIniciarJuego = () => {
+    setEsperandoResultados(true);
+    saveGameState({ esperandoResultados: true });
+    setShowRanking(true); // Mostrar el ranking cuando inicia el juego
+    socket.emit("start-game", { pin: codigo }, (response) => {
+      if (!response.success) {
+        setEsperandoResultados(false);
+        saveGameState({ esperandoResultados: false });
+        setShowRanking(false);
+        alert(response.error || "Error al iniciar el juego");
+      }
+    });
   };
 
   const renderContent = () => {
@@ -402,6 +525,54 @@ export default function Admin() {
                     <div className={styles.waitingResults}>
                       <div className={styles.spinner}></div>
                       <p>Esperando resultados del juego...</p>
+                      
+                      {/* Componente de Ranking */}
+                      {showRanking && (
+                        <div className={styles.liveRanking}>
+                          <h4>🏆 Ranking en Tiempo Real</h4>
+                          <div className={styles.rankingList}>
+                            {playerRankings && playerRankings.length > 0 ? (
+                              playerRankings
+                                .sort((a, b) => b.score - a.score)
+                                .map((player, index) => {
+                                  const maxScore = playerRankings[0]?.score || 1; // Evitar división por cero
+                                  const progressWidth = maxScore > 0 ? (player.score / maxScore) * 100 : 0;
+                                  
+                                  return (
+                                    <div key={player.id} className={styles.rankingItem}>
+                                      <span className={styles.rankPosition}>#{index + 1}</span>
+                                      <span className={styles.rankPlayerName}>
+                                        {player.username}
+                                      </span>
+                                      <span className={styles.rankScore}>
+                                        {player.score} pts
+                                      </span>
+                                      <div className={styles.rankProgress}>
+                                        <div 
+                                          className={styles.progressBar}
+                                          style={{
+                                            width: `${progressWidth}%`
+                                          }}
+                                        />
+                                      </div>
+                                      <div className={styles.stats}>
+                                        <span className={styles.statItem}>✓ {player.correctAnswers || 0}</span>
+                                        <span className={styles.statItem}>✗ {player.wrongAnswers || 0}</span>
+                                      </div>
+                                    </div>
+                                  );
+                                })
+                            ) : (
+                              <div className={styles.noRankings}>
+                                <p>Esperando jugadores...</p>
+                                <p className={styles.questionInfo}>
+                                  Pregunta actual: {currentQuestion} de {totalQuestions}
+                                </p>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
